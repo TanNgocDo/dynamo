@@ -405,8 +405,16 @@ pub struct WorkerEntry {
 type ListenerTask = (u32, JoinHandle<()>);
 
 enum Removal {
-    Worker,
-    DpRank(u32),
+    Worker {
+        indexer: Option<Indexer>,
+        key: RoutingPartitionId,
+        index: Arc<IndexRegistry>,
+        workers: Arc<DashMap<WorkerId, WorkerEntry>>,
+    },
+    DpRank {
+        indexer: Indexer,
+        dp_rank: u32,
+    },
 }
 
 #[derive(Default)]
@@ -418,7 +426,7 @@ struct WorkerLock {
 
 type WorkerLocks = Arc<DashMap<WorkerId, WorkerLock>>;
 
-/// Held by every registration and removal of one worker, until a removal is queued.
+/// Held by every registration and removal of one worker until its cleanup is complete.
 /// Counted as a user from before it waits, so a waiter dropped mid-wait is counted out.
 struct WorkerLifecycleGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -438,15 +446,13 @@ impl Drop for WorkerLifecycleGuard {
 
 /// Joins the listeners, then enqueues the removal behind everything they sent.
 ///
-/// Both run in a task of their own: the worker has already left the registry, so a
-/// caller dropped in between (a client gone from `/unregister`) must not leave it indexed.
-/// The task also keeps `lifecycle` until the removal is queued, so a new registration of
-/// this worker cannot index blocks the removal would then delete.
+/// Once the registry entry is gone, this task owns the remaining cleanup, including
+/// releasing an unused partition if the caller disconnects from `/unregister`.
+/// Holding `lifecycle` keeps a new registration of this worker behind that cleanup.
 async fn join_then_remove(
     lifecycle: WorkerLifecycleGuard,
     worker_id: WorkerId,
     tasks: Vec<ListenerTask>,
-    indexer: Option<Indexer>,
     removal: Removal,
 ) {
     let task = tokio::spawn(async move {
@@ -456,13 +462,24 @@ async fn join_then_remove(
                 tracing::error!(worker_id, dp_rank, %error, "ZMQ listener task ended abnormally");
             }
         }
-        let Some(indexer) = indexer else {
-            return;
-        };
         match removal {
-            Removal::Worker => indexer.remove_worker(worker_id).await,
+            Removal::Worker {
+                indexer,
+                key,
+                index,
+                workers,
+            } => {
+                if let Some(indexer) = indexer {
+                    indexer.remove_worker(worker_id).await;
+                }
+                index
+                    .release_if_unused(&key, || {
+                        workers.iter().any(|entry| entry.value().key == key)
+                    })
+                    .await;
+            }
             // Waits for the lane, so a lookup after deregistration no longer scores the rank.
-            Removal::DpRank(dp_rank) => {
+            Removal::DpRank { indexer, dp_rank } => {
                 if let Err(error) = indexer
                     .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
                     .await
@@ -478,7 +495,7 @@ async fn join_then_remove(
 }
 
 pub struct WorkerRegistry {
-    workers: DashMap<WorkerId, WorkerEntry>,
+    workers: Arc<DashMap<WorkerId, WorkerEntry>>,
     watermarks: DashMap<(WorkerId, u32), Arc<AtomicU64>>,
     peers: DashMap<String, ()>,
     root_cancel_token: CancellationToken,
@@ -523,7 +540,7 @@ impl WorkerRegistry {
     /// Listeners over an index registry someone else owns too (the selection core's).
     pub fn with_index(index: Arc<IndexRegistry>, root_cancel_token: CancellationToken) -> Self {
         Self {
-            workers: DashMap::new(),
+            workers: Arc::default(),
             watermarks: DashMap::new(),
             peers: DashMap::new(),
             root_cancel_token,
@@ -682,7 +699,7 @@ impl WorkerRegistry {
             bail!("instance {instance_id} not found");
         }
 
-        self.remove_worker_entry(lifecycle, instance_id, &key).await;
+        self.remove_worker_entry(lifecycle, instance_id, key).await;
         Ok(())
     }
 
@@ -692,7 +709,7 @@ impl WorkerRegistry {
         &self,
         lifecycle: WorkerLifecycleGuard,
         instance_id: WorkerId,
-        key: &RoutingPartitionId,
+        key: RoutingPartitionId,
     ) {
         let (tasks, indexer) = match self.workers.remove(&instance_id) {
             Some((_, entry)) => {
@@ -716,9 +733,14 @@ impl WorkerRegistry {
             None => (Vec::new(), None),
         };
         // Registration needs this map's write lock while removal can wait on indexer queues.
-        let indexer = indexer.or_else(|| self.index.indexer(key));
-        join_then_remove(lifecycle, instance_id, tasks, indexer, Removal::Worker).await;
-        self.release_indexer_if_unused(key).await;
+        let indexer = indexer.or_else(|| self.index.indexer(&key));
+        join_then_remove(
+            lifecycle,
+            instance_id,
+            tasks,
+            self.worker_removal(key, indexer),
+        )
+        .await;
     }
 
     pub async fn deregister_dp_rank(
@@ -766,21 +788,14 @@ impl WorkerRegistry {
                 .is_some();
 
         let removal = if remove_whole_worker {
-            Removal::Worker
+            self.worker_removal(key, Some(record.indexer()))
         } else {
-            Removal::DpRank(dp_rank)
+            Removal::DpRank {
+                indexer: record.indexer(),
+                dp_rank,
+            }
         };
-        join_then_remove(
-            lifecycle,
-            instance_id,
-            tasks,
-            Some(record.indexer()),
-            removal,
-        )
-        .await;
-        if remove_whole_worker {
-            self.release_indexer_if_unused(&key).await;
-        }
+        join_then_remove(lifecycle, instance_id, tasks, removal).await;
 
         Ok(())
     }
@@ -804,7 +819,7 @@ impl WorkerRegistry {
             bail!("instance {instance_id} not found");
         };
 
-        self.remove_worker_entry(lifecycle, instance_id, &key).await;
+        self.remove_worker_entry(lifecycle, instance_id, key).await;
         Ok(())
     }
 
@@ -1023,14 +1038,13 @@ impl WorkerRegistry {
         })
     }
 
-    /// Drop the partition's indexer once no registered worker names it (unless the
-    /// index retains empty indexers); the check runs under the index lifecycle lock.
-    async fn release_indexer_if_unused(&self, key: &RoutingPartitionId) {
-        self.index
-            .release_if_unused(key, || {
-                self.workers.iter().any(|entry| entry.value().key == *key)
-            })
-            .await;
+    fn worker_removal(&self, key: RoutingPartitionId, indexer: Option<Indexer>) -> Removal {
+        Removal::Worker {
+            indexer,
+            key,
+            index: self.index.clone(),
+            workers: self.workers.clone(),
+        }
     }
 }
 
@@ -1049,6 +1063,23 @@ mod tests {
 
     fn test_registry() -> WorkerRegistry {
         WorkerRegistry::new(1)
+    }
+
+    async fn deregister_for_test(registry: &WorkerRegistry, removal: &str) -> Result<()> {
+        match removal {
+            "worker" => registry.deregister(1, "test-model", "default").await,
+            "all_groups" => {
+                registry
+                    .deregister_all_routing_groups(1, "test-model")
+                    .await
+            }
+            "last_rank" => {
+                registry
+                    .deregister_dp_rank(1, 0, "test-model", "default")
+                    .await
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[rstest::rstest]
@@ -1079,22 +1110,7 @@ mod tests {
         };
         // Reserve the entire queue so removal must yield without blocking the executor.
         let permits = primary.saturate_mutation_queue_for_test().await;
-        let removal = async {
-            match removal {
-                "worker" => registry.deregister(1, "test-model", "default").await,
-                "all_groups" => {
-                    registry
-                        .deregister_all_routing_groups(1, "test-model")
-                        .await
-                }
-                "last_rank" => {
-                    registry
-                        .deregister_dp_rank(1, 0, "test-model", "default")
-                        .await
-                }
-                _ => unreachable!(),
-            }
-        };
+        let removal = deregister_for_test(&registry, removal);
         tokio::pin!(removal);
         assert!(matches!(
             removal
@@ -1173,22 +1189,7 @@ mod tests {
             Poll::Pending
         ));
 
-        let removal = async {
-            match removal {
-                "worker" => registry.deregister(1, "test-model", "default").await,
-                "all_groups" => {
-                    registry
-                        .deregister_all_routing_groups(1, "test-model")
-                        .await
-                }
-                "last_rank" => {
-                    registry
-                        .deregister_dp_rank(1, 0, "test-model", "default")
-                        .await
-                }
-                _ => unreachable!(),
-            }
-        };
+        let removal = deregister_for_test(&registry, removal);
         tokio::pin!(removal);
         assert!(matches!(
             removal
@@ -1937,6 +1938,123 @@ mod tests {
 
     fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    async fn seed_rank(indexer: &Indexer, worker: WorkerId, rank: u32, hash: u64) {
+        indexer
+            .apply_event_routed(store_event(
+                worker,
+                rank,
+                0,
+                &[],
+                &[hash],
+                StorageTier::Device,
+            ))
+            .await
+            .unwrap();
+        assert!(indexed_events(indexer, worker, rank).await > 0);
+    }
+
+    async fn drop_deregistration_and_wait(
+        registry: &WorkerRegistry,
+        indexer: &Indexer,
+        removal: impl Future<Output = Result<()>>,
+    ) {
+        // On a current-thread runtime the spawned cleanup cannot run between poll and drop.
+        let mut removal = Box::pin(removal);
+        assert!(poll_once(removal.as_mut()).is_pending());
+        drop(removal);
+        assert!(!registry.has_listener(1, 0));
+        assert!(!registry.watermarks.contains_key(&(1, 0)));
+
+        tokio::time::timeout(WATCHDOG, async {
+            // The worker lock orders us after cleanup. The dump drains queued removals.
+            let _finished = registry.lock_worker(1).await;
+            assert_eq!(indexed_events(indexer, 1, 0).await, 0);
+        })
+        .await
+        .expect("detached cleanup did not finish");
+    }
+
+    #[rstest::rstest]
+    #[case::worker("worker")]
+    #[case::all_groups("all_groups")]
+    #[case::last_rank("last_rank")]
+    #[tokio::test]
+    async fn dropped_deregistration_releases_partition(
+        #[case] removal: &str,
+        #[values(1, 2)] threads: usize,
+    ) {
+        let registry = WorkerRegistry::new(threads);
+        let key = RoutingPartitionId::new("test-model", "default");
+        register_for_test(&registry, 1, 0, "tcp://127.0.0.1:15557", None).await;
+        let indexer = registry.index().indexer(&key).unwrap();
+        seed_rank(&indexer, 1, 0, 11).await;
+
+        drop_deregistration_and_wait(&registry, &indexer, deregister_for_test(&registry, removal))
+            .await;
+        assert!(!registry.has_worker(1));
+        assert!(
+            !registry.index().contains(&key),
+            "empty partition stayed registered"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::remaining_worker(Some((2, 0)))]
+    #[case::remaining_rank(Some((1, 1)))]
+    #[case::retained_empty(None)]
+    #[tokio::test]
+    async fn dropped_deregistration_preserves_needed_partition(
+        #[case] survivor: Option<(WorkerId, u32)>,
+        #[values(1, 2)] threads: usize,
+    ) {
+        let registry = if survivor.is_none() {
+            let index = IndexRegistry::new(threads, Arc::new(KvIndexerMetrics::new_unregistered()));
+            WorkerRegistry::with_index(
+                Arc::new(index.with_retained_indexers()),
+                CancellationToken::new(),
+            )
+        } else {
+            WorkerRegistry::new(threads)
+        };
+        let key = RoutingPartitionId::new("test-model", "default");
+        register_for_test(&registry, 1, 0, "tcp://127.0.0.1:15557", None).await;
+        let indexer = registry.index().indexer(&key).unwrap();
+        seed_rank(&indexer, 1, 0, 11).await;
+        if let Some((worker, rank)) = survivor {
+            register_for_test(&registry, worker, rank, "tcp://127.0.0.1:15558", None).await;
+            seed_rank(&indexer, worker, rank, 22).await;
+        }
+
+        let sibling_rank = survivor == Some((1, 1));
+        let removal = async {
+            if sibling_rank {
+                registry
+                    .deregister_dp_rank(1, 0, "test-model", "default")
+                    .await
+            } else {
+                registry.deregister(1, "test-model", "default").await
+            }
+        };
+        drop_deregistration_and_wait(&registry, &indexer, removal).await;
+        assert_eq!(registry.has_worker(1), sibling_rank);
+        let current = registry
+            .index()
+            .indexer(&key)
+            .expect("partition must survive");
+        if let Some((worker, rank)) = survivor {
+            assert!(registry.has_listener(worker, rank));
+            let scores = current
+                .find_matches(vec![LocalBlockHash(22)])
+                .await
+                .unwrap();
+            assert_eq!(
+                scores.scores.get(&WorkerWithDpRank::new(worker, rank)),
+                Some(&1)
+            );
+        }
+        registry.root_cancel_token.cancel();
     }
 
     /// A re-registration of the worker waits until its removal is queued, so the removal
